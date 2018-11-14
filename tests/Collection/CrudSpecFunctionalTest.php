@@ -8,6 +8,8 @@ use MongoDB\InsertManyResult;
 use MongoDB\Driver\Exception\BulkWriteException;
 use MongoDB\Driver\Exception\RuntimeException;
 use MongoDB\Operation\FindOneAndReplace;
+use MongoDB\Tests\FunctionalTestCase as BaseFunctionalTestCase;
+use ArrayIterator;
 use IteratorIterator;
 use LogicException;
 use MultipleIterator;
@@ -17,31 +19,53 @@ use MultipleIterator;
  *
  * @see https://github.com/mongodb/specifications/tree/master/source/crud/tests
  */
-class CrudSpecFunctionalTest extends FunctionalTestCase
+class CrudSpecFunctionalTest extends BaseFunctionalTestCase
 {
-    private $expectedCollection;
+    private $collectionName;
+    private $databaseName;
+    private $dropCollectionsAfterTestPasses = [];
 
     public function setUp()
     {
         parent::setUp();
 
-        $this->expectedCollection = new Collection($this->manager, $this->getDatabaseName(), $this->getCollectionName() . '.expected');
-        $this->expectedCollection->drop();
+        $this->collectionName = null;
+        $this->databaseName = null;
+        $this->dropCollectionsAfterTestPasses = [];
+    }
+
+    public function tearDown()
+    {
+        if ( ! $this->hasFailed()) {
+            foreach ($this->dropCollectionsAfterTestPasses as $collection) {
+                $collection->drop();
+            }
+        }
+
+        $this->collectionName = null;
+        $this->databaseName = null;
+        $this->dropCollectionsAfterTestPasses = [];
+
+        parent::tearDown();
     }
 
     /**
      * @dataProvider provideSpecificationTests
      */
-    public function testSpecification(array $initialData, array $test, $minServerVersion, $maxServerVersion)
+    public function testSpecification(array $initialData, array $test, $minServerVersion, $maxServerVersion, $collectionName, $databaseName)
     {
+        /* Apply collection and database names immediately since it is not
+         * possible to do so during setUp(). */
+        $this->collectionName = $collectionName;
+        $this->databaseName = $databaseName;
+
         $this->setName(str_replace(' ', '_', $test['description']));
 
         if (isset($minServerVersion) || isset($maxServerVersion)) {
             $this->checkServerVersion($minServerVersion, $maxServerVersion);
         }
 
-        $expectedData = isset($test['outcome']['collection']['data']) ? $test['outcome']['collection']['data'] : null;
-        $this->initializeData($initialData, $expectedData);
+        $this->initializeData($initialData);
 
         $result = null;
         $exception = null;
@@ -64,9 +88,11 @@ class CrudSpecFunctionalTest extends FunctionalTestCase
 
             $minServerVersion = isset($json['minServerVersion']) ? $json['minServerVersion'] : null;
             $maxServerVersion = isset($json['maxServerVersion']) ? $json['maxServerVersion'] : null;
+            $collectionName = isset($json['collectionName']) ? $json['collectionName'] : null;
+            $databaseName = isset($json['databaseName']) ? $json['databaseName'] : null;
 
             foreach ($json['tests'] as $test) {
-                $testArgs[] = [$json['data'], $test, $minServerVersion, $maxServerVersion];
+                $testArgs[] = [$json['data'], $test, $minServerVersion, $maxServerVersion, $collectionName, $databaseName];
             }
         }
 
@@ -74,21 +100,25 @@ class CrudSpecFunctionalTest extends FunctionalTestCase
     }
 
     /**
-     * Assert that the collections contain equivalent documents.
+     * Return the test collection name.
      *
-     * @param Collection $expectedCollection
-     * @param Collection $actualCollection
+     * @see MongoDB\Tests\TestCase::getCollectionName()
+     * @return string
      */
-    private function assertEquivalentCollections($expectedCollection, $actualCollection)
+    protected function getCollectionName()
     {
-        $mi = new MultipleIterator;
-        $mi->attachIterator(new IteratorIterator($expectedCollection->find()));
-        $mi->attachIterator(new IteratorIterator($actualCollection->find()));
+        return isset($this->collectionName) ? $this->collectionName : parent::getCollectionName();
+    }
 
-        foreach ($mi as $documents) {
-            list($expectedDocument, $actualDocument) = $documents;
-            $this->assertSameDocument($expectedDocument, $actualDocument);
-        }
+    /**
+     * Return the test database name.
+     *
+     * @see MongoDB\Tests\TestCase::getCollectionName()
+     * @return string
+     */
+    protected function getDatabaseName()
+    {
+        return isset($this->databaseName) ? $this->databaseName : parent::getDatabaseName();
     }
 
     /**
@@ -120,15 +150,18 @@ class CrudSpecFunctionalTest extends FunctionalTestCase
      */
     private function executeOperation(array $operation)
     {
+        $collection = new Collection($this->manager, $this->getDatabaseName(), $this->getCollectionName());
+        $this->markCollectionForCleanup($collection);
+
         switch ($operation['name']) {
             case 'aggregate':
-                return $this->collection->aggregate(
+                return $collection->aggregate(
                     $operation['arguments']['pipeline'],
                     array_diff_key($operation['arguments'], ['pipeline' => 1])
                 );
 
             case 'bulkWrite':
-                return $this->collection->bulkWrite(
+                return $collection->bulkWrite(
                     array_map([$this, 'prepareBulkWriteRequest'], $operation['arguments']['requests']),
                     isset($operation['arguments']['options']) ? $operation['arguments']['options'] : []
                 );
@@ -136,24 +169,24 @@ class CrudSpecFunctionalTest extends FunctionalTestCase
             case 'count':
             case 'countDocuments':
             case 'find':
-                return $this->collection->{$operation['name']}(
+                return $collection->{$operation['name']}(
                     isset($operation['arguments']['filter']) ? $operation['arguments']['filter'] : [],
                     array_diff_key($operation['arguments'], ['filter' => 1])
                 );
 
             case 'estimatedDocumentCount':
-                return $this->collection->estimatedDocumentCount($operation['arguments']);
+                return $collection->estimatedDocumentCount($operation['arguments']);
 
             case 'deleteMany':
             case 'deleteOne':
             case 'findOneAndDelete':
-                return $this->collection->{$operation['name']}(
+                return $collection->{$operation['name']}(
                     $operation['arguments']['filter'],
                     array_diff_key($operation['arguments'], ['filter' => 1])
                 );
 
             case 'distinct':
-                return $this->collection->distinct(
+                return $collection->distinct(
                     $operation['arguments']['fieldName'],
                     isset($operation['arguments']['filter']) ? $operation['arguments']['filter'] : [],
                     array_diff_key($operation['arguments'], ['fieldName' => 1, 'filter' => 1])
@@ -164,7 +197,7 @@ class CrudSpecFunctionalTest extends FunctionalTestCase
                 // Fall through
 
             case 'replaceOne':
-                return $this->collection->{$operation['name']}(
+                return $collection->{$operation['name']}(
                     $operation['arguments']['filter'],
                     $operation['arguments']['replacement'],
                     array_diff_key($operation['arguments'], ['filter' => 1, 'replacement' => 1])
@@ -176,20 +209,20 @@ class CrudSpecFunctionalTest extends FunctionalTestCase
 
             case 'updateMany':
             case 'updateOne':
-                return $this->collection->{$operation['name']}(
+                return $collection->{$operation['name']}(
                     $operation['arguments']['filter'],
                     $operation['arguments']['update'],
                     array_diff_key($operation['arguments'], ['filter' => 1, 'update' => 1])
                 );
 
             case 'insertMany':
-                return $this->collection->insertMany(
+                return $collection->insertMany(
                     $operation['arguments']['documents'],
                     isset($operation['arguments']['options']) ? $operation['arguments']['options'] : []
                 );
 
             case 'insertOne':
-                return $this->collection->insertOne(
+                return $collection->insertOne(
                     $operation['arguments']['document'],
                     array_diff_key($operation['arguments'], ['document' => 1])
                 );
@@ -221,15 +254,11 @@ class CrudSpecFunctionalTest extends FunctionalTestCase
         }
 
         if (array_key_exists('result', $outcome)) {
-            $this->executeAssertResult($operation, $outcome['result'], $result);
+            $this->assertOutcomeResult($operation, $outcome['result'], $result);
         }
 
         if (isset($outcome['collection'])) {
-            $actualCollection = isset($outcome['collection']['name'])
-                ? new Collection($this->manager, $this->getDatabaseName(), $outcome['collection']['name'])
-                : $this->collection;
-
-            $this->assertEquivalentCollections($this->expectedCollection, $actualCollection);
+            $this->assertOutcomeCollection($outcome['collection']);
         }
     }
 
@@ -270,21 +299,43 @@ class CrudSpecFunctionalTest extends FunctionalTestCase
     }
 
     /**
-     * Executes the "result" section of an "outcome" block.
+     * Asserts the "collection" section of an "outcome" block.
+     *
+     * @param array $outcomeCollection
+     */
+    private function assertOutcomeCollection(array $outcomeCollection)
+    {
+        $collectionName = isset($outcomeCollection['name']) ? $outcomeCollection['name'] : $this->getCollectionName();
+        $collection = new Collection($this->manager, $this->getDatabaseName(), $collectionName);
+
+        $mi = new MultipleIterator;
+        $mi->attachIterator(new ArrayIterator($outcomeCollection['data']));
+        $mi->attachIterator(new IteratorIterator($collection->find()));
+
+        foreach ($mi as $documents) {
+            list($expectedDocument, $actualDocument) = $documents;
+            $this->assertSameDocument($expectedDocument, $actualDocument);
+        }
+
+        $this->markCollectionForCleanup($collection);
+    }
+
+    /**
+     * Asserts the "result" section of an "outcome" block.
      *
      * @param array $operation
      * @param mixed $expectedResult
      * @param mixed $actualResult
      * @throws LogicException if the operation is unsupported
      */
-    private function executeAssertResult(array $operation, $expectedResult, $actualResult)
+    private function assertOutcomeResult(array $operation, $expectedResult, $actualResult)
     {
         switch ($operation['name']) {
             case 'aggregate':
                 /* Returning a cursor for the $out collection is optional per
                  * the CRUD specification and is not implemented in the library
                  * since we have no concept of lazy cursors. We will not assert
-                 * the result here; however, assertEquivalentCollections() will
+                 * the result here; however, assertOutcomeCollection() will
                  * assert the output collection's contents later.
                  */
                 if ( ! \MongoDB\is_last_pipeline_operator_out($operation['arguments']['pipeline'])) {
@@ -434,17 +485,18 @@ class CrudSpecFunctionalTest extends FunctionalTestCase
      * Initializes data in the test collections.
      *
      * @param array $initialData
-     * @param array $expectedData
      */
-    private function initializeData(array $initialData, array $expectedData = null)
+    private function initializeData(array $initialData)
     {
-        if ( ! empty($initialData)) {
-            $this->collection->insertMany($initialData);
+        $collection = new Collection($this->manager, $this->getDatabaseName(), $this->getCollectionName());
+        $collection->drop();
+
+        if (empty($initialData)) {
+            return;
         }
 
-        if ( ! empty($expectedData)) {
-            $this->expectedCollection->insertMany($expectedData);
-        }
+        $collection->insertMany($initialData);
+        $this->markCollectionForCleanup($collection);
     }
 
     /**
@@ -484,6 +536,16 @@ class CrudSpecFunctionalTest extends FunctionalTestCase
             default:
                 throw new LogicException('Unsupported bulk write request: ' . $request['name']);
         }
+    }
+
+    /**
+     * Mark a collection to be dropped if the test passes.
+     *
+     * @param Collection $collection
+     */
+    private function markCollectionForCleanup(Collection $collection)
+    {
+        $this->dropCollectionsAfterTestPasses[$collection->getNamespace()] = $collection;
     }
 
     /**
