@@ -8,6 +8,7 @@ use MongoDB\InsertManyResult;
 use MongoDB\Driver\Exception\BulkWriteException;
 use MongoDB\Driver\Exception\RuntimeException;
 use MongoDB\Operation\FindOneAndReplace;
+use MongoDB\Tests\CommandObserver;
 use MongoDB\Tests\FunctionalTestCase as BaseFunctionalTestCase;
 use ArrayIterator;
 use IteratorIterator;
@@ -69,11 +70,23 @@ class CrudSpecFunctionalTest extends BaseFunctionalTestCase
 
         $result = null;
         $exception = null;
+        $commandStartedEvents = [];
 
-        try {
-            $result = $this->executeOperation($test['operation']);
-        } catch (RuntimeException $e) {
-            $exception = $e;
+        (new CommandObserver)->observe(
+            function() use ($test, &$result, &$exception) {
+                try {
+                    $result = $this->executeOperation($test['operation']);
+                } catch (RuntimeException $e) {
+                    $exception = $e;
+                }
+            },
+            function(array $event) use (&$commandStartedEvents) {
+                $commandStartedEvents[] = $event['started'];
+            }
+        );
+
+        if (isset($test['expectations'])) {
+            $this->executeExpectations($test['expectations'], $commandStartedEvents);
         }
 
         $this->executeOutcome($test['operation'], $test['outcome'], $result, $exception);
@@ -83,7 +96,8 @@ class CrudSpecFunctionalTest extends BaseFunctionalTestCase
     {
         $testArgs = [];
 
-        foreach (glob(__DIR__ . '/spec-tests/*/*.json') as $filename) {
+        foreach (glob(__DIR__ . '/spec-tests/read/aggregate-out.json') as $filename) {
+        //foreach (glob('/home/jmikola/workspace/mongodb/specifications/source/crud/tests/write/bulkWrite-arrayFilters.json') as $filename) {
             $json = json_decode(file_get_contents($filename), true);
 
             $minServerVersion = isset($json['minServerVersion']) ? $json['minServerVersion'] : null;
@@ -138,6 +152,31 @@ class CrudSpecFunctionalTest extends BaseFunctionalTestCase
 
         if (isset($maxServerVersion) && version_compare($serverVersion, $maxServerVersion, '>=')) {
             $this->markTestSkipped(sprintf('Server version "%s" >= maxServerVersion "%s"', $serverVersion, $maxServerVersion));
+        }
+    }
+
+    /**
+     * Executes an "expectations" block.
+     *
+     * This will check that the expected sequence of "command_started_event"
+     * documents matches the observed CommandStartedEvents.
+     *
+     * @param array                 $expectations
+     * @param CommandStartedEvent[] $commandStartedEvents
+     */
+    private function executeExpectations(array $expectations, array $commandStartedEvents)
+    {
+        $mi = new MultipleIterator(MultipleIterator::MIT_NEED_ANY);
+        $mi->attachIterator(new ArrayIterator($expectations));
+        $mi->attachIterator(new ArrayIterator($commandStartedEvents));
+
+        foreach ($mi as $events) {
+            list($expectedEvent, $commandStartedEvent) = $events;
+            $expectedCommandStartedEvent = $expectedEvent['command_started_event'];
+
+            $this->assertSame($expectedCommandStartedEvent['command_name'], $commandStartedEvent->getCommandName());
+            $this->assertSame($expectedCommandStartedEvent['database_name'], $commandStartedEvent->getDatabaseName());
+            $this->assertSameDocument($expectedCommandStartedEvent['command'], $commandStartedEvent->getCommand());
         }
     }
 
